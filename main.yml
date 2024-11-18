@@ -1,0 +1,53 @@
+---
+# Usage
+# ansible-galaxy install -r requirements.yml -p roles
+# ansible-navigator run --eei localhost/role-dev-ee -m stdout main.yml -i inventory/inventory.yml
+
+- name: Create a webhost
+  hosts: web_hosts
+  gather_facts: true
+  vars_files:
+    - inventory/secrets.yml
+
+  roles:
+    - name: apigban.rhel-9.3-base
+      vars:
+        node_hostname: "{{ inventory_hostname }}"
+        network:
+          - name: ens18
+            ipv4_address: "{{ ansible_host }}/24"
+            type: ethernet
+            ip:
+              gateway4: "172.21.5.1"
+    - name: devsec.hardening.os_hardening
+    - name: apigban.devbox-role
+    - name: apigban.hugo_webhost
+
+- name: Configure Caddy Reverse Proxy
+  hosts: dmz01
+  gather_facts: true
+  become: true
+  vars_files:
+    - inventory/secrets.yml
+
+  tasks:
+    - name: Ensure Caddy configuration directory exists
+      ansible.builtin.file:
+        path: "{{ caddy_etc_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Deploy Caddy reverse proxy configuration
+      ansible.builtin.template:
+        src: Caddyfile-dmz.j2
+        dest: "{{ caddy_etc_path }}/Caddyfile"
+        mode: '0755'
+        force: true
+      notify: Reload Caddy
+
+  handlers:
+    - name: Reload Caddy
+      become: true
+      become_user: contsvc
+      ansible.builtin.command:
+        cmd: /usr/bin/podman restart caddy

@@ -1,0 +1,14 @@
+---
+collections:
+  - name: devsec.hardening
+roles:
+  - name: apigban.rhel-9.3-base
+    src: git+https://git.home.apigban.com/apigban/rhel-9.3-base
+
+  - name: apigban.devbox-role
+    src: git+https://git.home.apigban.com/apigban/devbox-role
+
+  - name: apigban.hugo_webhost
+    src: git+https://git.home.apigban.com/apigban/hugo_webhost.git
+
+  - name: caddy_ansible.caddy_ansible

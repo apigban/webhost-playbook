@@ -1,0 +1,32 @@
+---
+packages:
+  - firewalld
+  - iotop
+  - tmux
+  - qemu-guest-agent
+  - vim
+  - git
+  - container-tools
+  - epel-release
+
+site_name: alain.apigban.com
+repo_url: https://github.com/apigban/{{ site_name }}.git
+site_path: /home/ansible/sites/{{ site_name }}
+
+
+web_path: /var/www/html
+caddy_etc_path: /home/contsvc/.local/share/containers/storage/volumes/caddy_etc/_data
+
+hugo:
+  commands:
+    - /usr/local/bin/hugo mod get -u 
+    - /usr/local/bin/hugo mod tidy
+    - /usr/local/bin/hugo mod npm pack
+    - npm install
+    - /usr/local/bin/hugo
+
+sites:
+  - name: alain.apigban.com
+    local_path: /var/www/html
+    repo_url: https://github.com/apigban/alain.apigban.com.git
+    port: 10000

@@ -1,0 +1,72 @@
+{
+        order coraza_waf first
+        email {{ namecheap_email}}
+        debug
+        admin :2019
+        crowdsec {
+                api_url http://localhost:8080
+                api_key {{ crowdsec_api_key }}
+                ticker_interval 15s
+        }
+}
+
+(namecheap_ssl_nextcloud) {
+        tls {
+                dns namecheap {
+                        api_key {{ namecheap_api_key }}
+                        user {{ namecheap_user }}
+                        client_ip {{ namecheap_client_ip }}
+                        api_endpoint https://api.namecheap.com/xml.response
+                }
+                resolvers 1.1.1.1 8.8.8.8
+        }
+}
+
+{% for domain in sites %}
+https://{{ domain.name }} {
+        import namecheap_ssl_nextcloud
+        route {
+                crowdsec
+                reverse_proxy {% for host in groups['web_hosts'] %}{{ hostvars[host].ansible_host }}:{{ domain.port }} {% endfor %} {
+                        lb_policy ip_hash
+                        health_uri /
+                        health_interval 10s
+                        health_timeout 5s
+                        health_status_code 200
+                }
+        }
+        coraza_waf {
+                load_owasp_crs
+                directives `
+                Include /etc/caddy/corazawaf/ruleset/coraza.conf
+                Include /etc/caddy/corazawaf/ruleset/prod.conf
+                Include @owasp_crs/*.conf
+                SecRuleEngine On
+                `
+        }
+        log {
+                output file /var/log/access-{{ domain.name }}.log
+        }
+}
+{% endfor %}
+
+# DOMAINS NOT MANAGED BY ANSIBLE
+https://pingvin.apigban.com {
+        import namecheap_ssl_nextcloud
+        route {
+                crowdsec
+                reverse_proxy 172.21.5.100:3000
+        }
+        coraza_waf {
+                load_owasp_crs
+                directives `
+                Include /etc/caddy/corazawaf/ruleset/coraza.conf
+                Include /etc/caddy/corazawaf/ruleset/prod.conf
+                Include @owasp_crs/*.conf
+                SecRuleEngine On
+                `
+        }
+        log {
+                output file /var/log/access.log
+        }
+}

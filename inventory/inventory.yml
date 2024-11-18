@@ -1,0 +1,19 @@
+---
+all:
+  children:
+    web_hosts:
+      hosts:
+        web001:    
+          ansible_host: 172.21.5.201
+          ansible_user: ansible
+          ansible_ssh_private_key_file: inventory/key/home
+        web002:
+          ansible_host: 172.21.5.202
+          ansible_user: ansible
+          ansible_ssh_private_key_file: inventory/key/home
+    proxies:
+      hosts:
+        dmz01:
+          ansible_host: "{{ namecheap_client_ip }}"
+          ansible_user: "{{ ansible_proxy_user }}"
+          ansible_ssh_private_key_file: inventory/key/home
