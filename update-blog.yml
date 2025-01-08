@@ -1,0 +1,15 @@
+---
+# Usage
+# ansible-galaxy install -r requirements.yml -p roles
+# ansible-navigator run --eei localhost/role-dev-ee -m stdout update-blog.yml -i inventory/inventory.yml
+
+- name: Update content for blog
+  hosts: web_hosts
+  gather_facts: true
+  vars_files:
+    - inventory/secrets.yml
+  vars:
+    only_update_content: true
+
+  roles:
+    - name: apigban.hugo_webhost
