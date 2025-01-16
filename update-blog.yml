@@ -13,3 +13,12 @@
 
   roles:
     - name: apigban.hugo_webhost
+  
+  tasks:
+    - name: Download umami tracking script to webservers
+      ansible.builtin.copy:
+        src: files/script.js
+        dest: /home/ansible/sites/{{ site_name }}/public/script.js
+        owner: ansible
+        group: www-data
+        mode: "0755"
