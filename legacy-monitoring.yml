@@ -5,12 +5,14 @@
 # Alloy is the monitoring system of record; the local prometheus/grafana containers are
 # the legacy plane). Recorded decision + rationale: docs/legacy-monitoring-decision.md
 #
-# Decision knob (override via group_vars/host_vars or -e):
+# Decision knobs (override via group_vars/host_vars or -e):
 #   legacy_monitoring_enabled: false  (default, recommended) -> RETIRE:
 #       stop+remove the prometheus and grafana containers (podman named volumes
 #       'prometheus'/'grafana' are preserved unless legacy_monitoring_purge_volumes
-#       is true), remove their firewalld ports plus the stale 9101/tcp and
-#       19122/udp entries, and drop them from the bootstrap crontab.
+#       is true), remove their firewalld ports plus the listener-free 19122/udp
+#       entry, and drop them from the bootstrap crontab. 9101/tcp is NOT removed
+#       by default: node_exporter listens on *:9101 (it is not stale — see the
+#       group_vars knob legacy_monitoring_remove_nodeexporter_firewall_port).
 #   legacy_monitoring_enabled: true -> REBIND:
 #       containers re-created bound to 127.0.0.1 only (unreachable from the
 #       tailnet), prometheus re-created WITHOUT --web.enable-admin-api; ports
@@ -18,7 +20,9 @@
 #
 # Idempotency:
 #   - ansible.posix.firewalld state=disabled no-ops once the ports are absent.
-#   - container removal no-ops on missing containers (podman returns rc=125).
+#   - container/volume removal no-ops on missing objects (podman 5.x returns
+#     rc=1 with a "no such container/volume" error; only that not-found error
+#     is accepted — any other rc=1 failure still fails the play).
 #   - the rebind path only re-creates a container when its live publish binding
 #     is not 127.0.0.1 (checked read-only via podman inspect), so converged hosts
 #     do not churn.
@@ -30,7 +34,8 @@
 #   curl -m 5 http://<dmz01-tailnet-ip>:9100/   -> connection refused / timeout
 #   On dmz01: crontab -l (as contsvc) -> job under the marker matches the chosen mode
 #   On dmz01: sudo firewall-cmd --list-ports --zone=public
-#             -> no 3000/tcp, 9100/tcp, 9101/tcp, 19122/udp
+#             -> no 3000/tcp, 9100/tcp, 19122/udp
+#             (9101/tcp only when the remove-nodeexporter knob was set)
 
 - name: Retire or rebind the legacy local monitoring plane (prometheus/grafana containers)
   hosts: dmz01
@@ -42,8 +47,11 @@
     legacy_monitoring_firewalld_ports:
       - "3000/tcp"    # legacy grafana (removed, or loopback-bound: never published)
       - "9100/tcp"    # legacy prometheus (removed, or loopback-bound: never published)
-      - "9101/tcp"    # stale entry: no listener behind it
       - "19122/udp"   # stale entry: no listener behind it
+    # NOT here: 9101/tcp. node_exporter listens on *:9101 on dmz01 (the earlier
+    # audit that called the port stale was wrong — unprivileged `ss` hid the
+    # root-owned listener), so removing it is gated behind the operator-confirmed
+    # group_vars knob legacy_monitoring_remove_nodeexporter_firewall_port.
     legacy_monitoring_grafana_image: docker.io/grafana/grafana:11.4.0
     legacy_monitoring_prometheus_image: quay.io/prometheus/prometheus:v3.0.1
     # Bootstrap crontab job, per mode; caddy -> crowdsec -> opencode order preserved.
@@ -62,7 +70,10 @@
       changed_when: false
       check_mode: false
 
-    # --- firewalld: close the plane and the stale entries (same in both modes) ---
+    # --- firewalld: close the plane and the stale entry (same in both modes) ---
+    # 9101/tcp is appended to the removal list ONLY when the operator has
+    # confirmed nothing scrapes node_exporter over that port
+    # (legacy_monitoring_remove_nodeexporter_firewall_port, default false).
     - name: Remove legacy monitoring and stale ports from firewalld (permanent + runtime)
       ansible.posix.firewalld:
         port: "{{ item }}"
@@ -70,7 +81,8 @@
         permanent: true
         immediate: true
         state: disabled
-      loop: "{{ legacy_monitoring_firewalld_ports }}"
+      loop: "{{ legacy_monitoring_firewalld_ports
+                + (['9101/tcp'] if legacy_monitoring_remove_nodeexporter_firewall_port | default(false) | bool else []) }}"
 
     # --- containers: RETIRE path (default decision, per ADR-0001) ---
     - name: Retire the legacy monitoring containers (decision = removal per ADR-0001)
@@ -79,51 +91,51 @@
         XDG_RUNTIME_DIR: "/run/user/{{ legacy_monitoring_podman_uid.stdout }}"
       when: not legacy_monitoring_enabled
       block:
-        - name: Remove legacy prometheus container (data volume preserved)
+        - name: Remove legacy monitoring containers (data volumes preserved)
+          # podman 5.8.2 on dmz01 returns rc=1 (not 125) with "no such container"
+          # for a missing container — accept exactly that not-found error as a
+          # no-op; any other rc=1 failure still fails the play.
           ansible.builtin.command:
             argv:
               - podman
               - rm
               - --force
-              - prometheus
-          register: legacy_monitoring_rm_prometheus
-          changed_when: legacy_monitoring_rm_prometheus.rc == 0
-          failed_when: legacy_monitoring_rm_prometheus.rc not in [0, 125]
+              - "{{ item }}"
+          register: legacy_monitoring_rm
+          changed_when: legacy_monitoring_rm.rc == 0
+          failed_when: >-
+            legacy_monitoring_rm.rc not in [0, 1]
+            or (legacy_monitoring_rm.rc == 1
+                and legacy_monitoring_rm.stderr is not
+                    search('(?i)no such container|no container with name|unable to find'))
+          loop:
+            - prometheus
+            - grafana
+          loop_control:
+            label: "{{ item }}"
 
-        - name: Remove legacy grafana container (data volume preserved)
-          ansible.builtin.command:
-            argv:
-              - podman
-              - rm
-              - --force
-              - grafana
-          register: legacy_monitoring_rm_grafana
-          changed_when: legacy_monitoring_rm_grafana.rc == 0
-          failed_when: legacy_monitoring_rm_grafana.rc not in [0, 125]
-
-        - name: Purge legacy prometheus volume (destructive, opt-in)
-          ansible.builtin.command:
-            argv:
-              - podman
-              - volume
-              - rm
-              - prometheus
-          register: legacy_monitoring_purge_prometheus
-          changed_when: legacy_monitoring_purge_prometheus.rc == 0
-          failed_when: legacy_monitoring_purge_prometheus.rc not in [0, 125]
-          when: legacy_monitoring_purge_volumes
-
-        - name: Purge legacy grafana volume (destructive, opt-in)
+        - name: Purge legacy monitoring volumes (destructive, opt-in)
+          # Same not-found contract as the container removal above ("no such
+          # volume" / "no volume named" on rc=1).
           ansible.builtin.command:
             argv:
               - podman
               - volume
               - rm
-              - grafana
-          register: legacy_monitoring_purge_grafana
-          changed_when: legacy_monitoring_purge_grafana.rc == 0
-          failed_when: legacy_monitoring_purge_grafana.rc not in [0, 125]
+              - "{{ item }}"
+          register: legacy_monitoring_purge
+          changed_when: legacy_monitoring_purge.rc == 0
+          failed_when: >-
+            legacy_monitoring_purge.rc not in [0, 1]
+            or (legacy_monitoring_purge.rc == 1
+                and legacy_monitoring_purge.stderr is not
+                    search('(?i)no such volume|no volume named'))
           when: legacy_monitoring_purge_volumes
+          loop:
+            - prometheus
+            - grafana
+          loop_control:
+            label: "{{ item }}"
 
     # --- containers: REBIND path (opt-in override) ---
     - name: Rebind the legacy monitoring containers to loopback only
