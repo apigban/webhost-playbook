@@ -47,3 +47,16 @@ This playbook automates three main tasks:
 - CrowdSec integration
 - Automated SSL/TLS management
 - Separate access logs per domain
+
+### Runner egress boundary (dmz01)
+
+`runner-egress.yml` restricts what GitHub Actions job code on dmz01 can reach:
+the `github-runner` user is blocked from LAN/WireGuard/tailscale ranges and the
+host's own services, while GitHub, package registries, and DNS keep working.
+Deployed as a separate nftables table (firewalld is not touched); **audit mode
+is the default** — promote with `-e runner_egress_enforce=true` after reviewing
+`nft list chain inet runner_egress runner_policy` and
+`journalctl -k --grep 'egress-audit'`. Design, research citations, ownership
+record, and residual risks: `docs/runner-egress-decision.md`. Secrets-exposure
+audit of the 11 runner repos: `docs/runner-secrets-audit.md`. Ready-to-commit
+verification workflows: `files/runner-egress-tests/`.

@@ -1,0 +1,81 @@
+# Runner egress verification — Test job A: legitimate CI egress works
+#
+# Operator procedure: copy this file into a runner-enabled repo as
+# `.github/workflows/runner-egress-test-egress.yml`, then run it manually
+# (workflow_dispatch). It must be GREEN in BOTH audit and enforce modes.
+#
+# Expected: every probe below establishes a TCP connection to a public CI
+# endpoint (any HTTP status counts; http_code 000 means the connection failed).
+# DNS resolves via tailscale MagicDNS (100.100.100.100:53 carve-out).
+#
+# Refs: apigban/dmz01#13.
+name: runner-egress check A (legit CI egress)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  legit-egress:
+    runs-on: [self-hosted, agy]
+    timeout-minutes: 10
+    steps:
+      - name: Preflight — confirm we are the filtered UID
+        run: |
+          echo "user: $(id -un) uid: $(id -u)"
+          [[ "$(id -u)" == "$(id -u github-runner)" ]] || {
+            echo "unexpected: job does not run as github-runner"; exit 1; }
+
+      - name: DNS resolution via carved-out resolver
+        run: |
+          set -euo pipefail
+          for host in github.com api.github.com codeload.github.com \
+                      registry.npmjs.org pypi.org; do
+            getent hosts "$host" >/dev/null || { echo "FAIL: DNS $host"; exit 1; }
+            echo "ok: resolved $host"
+          done
+
+      - name: TCP connect — GitHub required domains
+        run: |
+          set -euo pipefail
+          for url in https://github.com https://api.github.com \
+                     https://objects.githubusercontent.com \
+                     https://codeload.github.com; do
+            code=$(curl -sS -o /dev/null --connect-timeout 8 --max-time 15 \
+                    -w '%{http_code}' "$url")
+            [[ "$code" != "000" ]] || { echo "FAIL: $url unreachable"; exit 1; }
+            echo "ok: $url -> http $code"
+          done
+
+      - name: TCP connect — git over HTTPS
+        run: |
+          git ls-remote https://github.com/apigban/webhost-playbook.git HEAD
+
+      - name: TCP connect — package registries
+        run: |
+          set -euo pipefail
+          for url in https://registry.npmjs.org/ \
+                     https://pypi.org/simple/; do
+            code=$(curl -sS -o /dev/null --connect-timeout 8 --max-time 15 \
+                    -w '%{http_code}' "$url")
+            [[ "$code" != "000" ]] || { echo "FAIL: $url unreachable"; exit 1; }
+            echo "ok: $url -> http $code"
+          done
+
+      - name: TCP connect — LLM API plane used by agy/opencode review jobs
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null --connect-timeout 8 --max-time 15 \
+                  -w '%{http_code}' https://generativelanguage.googleapis.com/)
+          [[ "$code" != "000" ]] || { echo "FAIL: gemini API unreachable"; exit 1; }
+          echo "ok: generativelanguage.googleapis.com -> http $code"
+
+      - name: DNS carve-out is port-scoped (100.100.100.100:80 must fail)
+        run: |
+          code=$(curl -sS -o /dev/null --connect-timeout 4 --max-time 6 \
+                  -w '%{http_code}' http://100.100.100.100/ || true)
+          [[ "$code" == "000" ]] || {
+            echo "FAIL: 100.100.100.100:80 reachable (http $code) — carve-out too wide"; exit 1; }
+          echo "ok: 100.100.100.100 answers only on :53"

@@ -1,0 +1,61 @@
+# Managed file — deployed by webhost-playbook `runner-egress.yml` (apigban/dmz01#13).
+# DO NOT EDIT on the host; changes belong in the template + play re-run.
+#
+# Runner egress boundary for GitHub Actions jobs: {{ runner_egress_user }} (UID {{ runner_egress_uid_resolved }}).
+# Mode: {{ 'ENFORCE — drop verdicts active' if runner_egress_enforce else 'AUDIT — counters + rate-limited kernel log only, NO drops' }}
+#
+# Design notes (see docs/runner-egress-decision.md in webhost-playbook):
+# - Separate `inet runner_egress` table: nftables tables are namespaces, so this
+#   coexists with firewalld's `inet firewalld` table without touching it.
+#   firewalld cannot match by originating UID (open RFE firewalld#725), which is
+#   why this boundary lives outside firewalld entirely.
+# - Output-hook filter chain with policy accept: non-matching traffic (every UID
+#   except the runner user, including the operator) falls through untouched and
+#   continues to any later base chain. Drops anywhere in the hook are final.
+# - The add/delete/add table idiom makes `nft -f` a full atomic replace (single
+#   netlink transaction): re-running the loader can never leave stale rules.
+table inet runner_egress
+delete table inet runner_egress
+table inet runner_egress {
+
+    chain egress {
+        type filter hook output priority 10; policy accept;
+
+        # Only the dedicated runner user's locally-created sockets are inspected.
+        meta skuid {{ runner_egress_uid_resolved }} jump runner_policy
+    }
+
+    chain runner_policy {
+        # --- DNS carve-outs (port 53 only) -------------------------------------
+        # /etc/resolv.conf is tailscale-managed on this host: the resolver lives
+        # INSIDE the CGNAT/ULA ranges that are dropped below. Without these
+        # carve-outs the runner user would lose DNS entirely and CI would break.
+        # Port-scoped: any other port to these IPs is still dropped.
+{% for ip in runner_egress_dns_v4 %}
+        ip daddr {{ ip }} meta l4proto { tcp, udp } th dport 53 counter accept comment "dns carve-out {{ ip }}"
+{% endfor %}
+{% for ip in runner_egress_dns_v6 %}
+        ip6 daddr {{ ip }} meta l4proto { tcp, udp } th dport 53 counter accept comment "dns carve-out {{ ip }}"
+{% endfor %}
+
+        # --- IPv4 internal + bogon destinations --------------------------------
+        # loopback services (legacy grafana :3000 / prometheus :9100, speakr :8899,
+        # agent server :4096, t3 :3773 wherever they bind loopback), RFC1918 LAN
+        # and WireGuard routes (192.168.2.0/24, 172.21.5.0/24, 172.16.5.0/24 via
+        # wg0, host subnet 10.20.1.0/24, wg peer 10.200.0.253), tailscale CGNAT
+        # (100.96.131.75 and peers), link-local incl. cloud metadata, bogons.
+        # No `ct state established` exception on purpose: internal destinations are
+        # dropped for the runner UID regardless of connection state.
+{% for net in runner_egress_block_v4 %}
+        ip daddr {{ net }} counter log prefix "egress-{{ 'drop' if runner_egress_enforce else 'audit' }} " limit rate {{ runner_egress_log_rate }}/second {{ 'drop' if runner_egress_enforce else 'continue' }} comment "blocked: {{ net }}"
+{% endfor %}
+
+        # --- IPv6 internal destinations ----------------------------------------
+        # ::1 loopback; fc00::/7 covers tailscale ULA (fd7a:115c:a1e0::/48, incl.
+        # this host's own v6 address); fe80::/10 link-local. There is no global
+        # unicast IPv6 on this host, so this covers all v6 destinations.
+{% for net in runner_egress_block_v6 %}
+        ip6 daddr {{ net }} counter log prefix "egress-{{ 'drop' if runner_egress_enforce else 'audit' }} " limit rate {{ runner_egress_log_rate }}/second {{ 'drop' if runner_egress_enforce else 'continue' }} comment "blocked: {{ net }}"
+{% endfor %}
+    }
+}

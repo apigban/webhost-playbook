@@ -1,0 +1,21 @@
+[Unit]
+# Deployed by webhost-playbook `runner-egress.yml` (apigban/dmz01#13).
+# Loads the runner-egress nftables table (separate from firewalld's own table;
+# firewalld start/reload/restart never touches it, and vice versa).
+Description=Runner egress nftables filter (webhost-playbook runner-egress.yml)
+Documentation=file:/etc/nftables.d/runner-egress.nft
+# Load early so the egress boundary exists before runners/jobs can run.
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=network.target
+
+[Service]
+Type=oneshot
+# `nft -f` on this file is an atomic full replace (add/delete/add table idiom
+# inside the file), so start and restart are both idempotent.
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/runner-egress.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/runner-egress.nft
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
