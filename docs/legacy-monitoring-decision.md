@@ -11,7 +11,7 @@
 dmz01 runs two monitoring planes:
 
 1. **Alloy → Grafana Cloud** (`alloy.service`) — the active pipeline and system of record (ADR-0001).
-2. **Legacy local containers** (rootless podman under `contsvc`) — pre-Alloy prometheus (`0.0.0.0:9100`, `--web.enable-admin-api` on, scrape jobs commented out) and grafana (`0.0.0.0:3000`, static admin password). Both bind to **all interfaces**: every device on the tailnet can reach an unauthenticated admin API and a statically-passworded dashboard. The 2026-11-06 audit also found firewalld carrying `9101/tcp` and `19122/udp` with **no listener behind them** — stale entries that make the audit story lie.
+2. **Legacy local containers** (rootless podman under `contsvc`) — pre-Alloy prometheus (`0.0.0.0:9100`, `--web.enable-admin-api` on, scrape jobs commented out) and grafana (`0.0.0.0:3000`, static admin password). Both bind to **all interfaces**: every device on the tailnet can reach an unauthenticated admin API and a statically-passworded dashboard. The 2026-11-06 audit flagged firewalld carrying `9101/tcp` and `19122/udp`; a re-check showed **only `19122/udp` is listener-free**. `9101/tcp` is live — `node_exporter` listens on `*:9101` (root-owned; the initial unprivileged `ss` check hid it) — so removing it is gated behind `legacy_monitoring_remove_nodeexporter_firewall_port` (default `false`) and requires the operator to first confirm nothing scrapes node_exporter over that port.
 
 ## Options
 
@@ -20,7 +20,8 @@ dmz01 runs two monitoring planes:
 | Containers | stopped + removed | re-created bound to `127.0.0.1` only |
 | Prometheus admin API | moot (gone) | flag removed (`--web.enable-admin-api` off) |
 | firewalld | `3000/tcp`, `9100/tcp` removed | also kept closed (loopback needs no rule) |
-| Stale `9101/tcp`, `19122/udp` | removed | removed |
+| Stale `19122/udp` | removed | removed |
+| `9101/tcp` (node_exporter listener — NOT stale) | kept unless `legacy_monitoring_remove_nodeexporter_firewall_port: true` | kept unless the knob is set |
 | Bootstrap crontab | starts only caddy/crowdsec/opencode | keeps starting both (loopback-bound) |
 | Data volumes (`prometheus`, `grafana`) | **preserved** unless `legacy_monitoring_purge_volumes: true` | preserved |
 | Tailnet exposure | eliminated | eliminated (loopback only) |
@@ -36,6 +37,8 @@ dmz01 runs two monitoring planes:
 - Fewer long-running things = fewer things for the audit to re-explain next time.
 
 **Override**: set `legacy_monitoring_enabled: true` (host_var/group_var or `-e`) if the operator wants local-only dashboards kept; the playbook then rebinds both containers to loopback and drops the admin API flag. This is recorded in the same knob — one deploy-time choice, no fork in the codebase.
+
+Second knob: `legacy_monitoring_remove_nodeexporter_firewall_port` (default `false`) additionally closes firewalld `9101/tcp`. It must only be set after the operator confirms nothing scrapes `node_exporter` over that port — the port is not stale; a root-owned `node_exporter` listens on `*:9101`.
 
 ## Safety / blast radius
 
@@ -56,7 +59,8 @@ On dmz01 (read-only):
 
 ```
 crontab -l                                   # job matches chosen mode
-sudo firewall-cmd --list-ports --zone=public # no 3000/tcp, 9100/tcp, 9101/tcp, 19122/udp
+sudo firewall-cmd --list-ports --zone=public # no 3000/tcp, 9100/tcp, 19122/udp
+                                             # (9101/tcp only if the remove-nodeexporter knob was set)
 podman ps                                    # (retire) no prometheus/grafana; caddy/crowdsec/speakr intact
 ```
 

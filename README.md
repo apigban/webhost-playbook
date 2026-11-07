@@ -43,8 +43,11 @@ This playbook automates three main tasks:
 ### Legacy Monitoring Plane (dmz01)
 
 `legacy-monitoring.yml` retires (default) or loopback-rebinds the pre-Alloy local
-prometheus/grafana containers and removes their firewalld ports plus the stale
-`9101/tcp` / `19122/udp` entries. The decision knob is
+prometheus/grafana containers and removes their firewalld ports plus the
+listener-free `19122/udp` entry. `9101/tcp` is **not** stale — `node_exporter`
+listens on it — and is only closed when you set
+`legacy_monitoring_remove_nodeexporter_firewall_port=true` after confirming
+nothing scrapes node_exporter over that port. The decision knob is
 `legacy_monitoring_enabled` (group_var, default `false` = retire; data volumes
 preserved). Rationale and blast radius: [docs/legacy-monitoring-decision.md](docs/legacy-monitoring-decision.md).
 

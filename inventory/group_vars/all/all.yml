@@ -34,8 +34,8 @@ sites:
 # Legacy monitoring plane on dmz01 (apigban/dmz01#9, dmz01 docs ADR-0001; see
 # legacy-monitoring.yml and docs/legacy-monitoring-decision.md).
 #   false (default, recommended): RETIRE — remove the legacy prometheus/grafana
-#     containers, close firewalld 3000/tcp + 9100/tcp and the stale 9101/tcp +
-#     19122/udp entries, and drop both from the bootstrap crontab. The podman
+#     containers, close firewalld 3000/tcp + 9100/tcp and the listener-free
+#     19122/udp entry, and drop both from the bootstrap crontab. The podman
 #     named volumes (TSDB / grafana data) are preserved unless
 #     legacy_monitoring_purge_volumes is true.
 #   true: REBIND — keep the containers but publish them on 127.0.0.1 only and
@@ -43,3 +43,11 @@ sites:
 #     firewalld.
 legacy_monitoring_enabled: false
 legacy_monitoring_purge_volumes: false
+
+# 9101/tcp is NOT a stale firewalld entry: node_exporter listens on *:9101 on
+# dmz01 (the 2026-11-06 audit that called it stale was wrong — unprivileged
+# `ss` hides a root-owned listener). Set to true ONLY after confirming that
+# nothing scrapes node_exporter over that port (e.g. the Alloy -> Grafana
+# Cloud pipeline); then legacy-monitoring.yml also closes 9101/tcp. Default
+# false: 9101/tcp stays open.
+legacy_monitoring_remove_nodeexporter_firewall_port: false
