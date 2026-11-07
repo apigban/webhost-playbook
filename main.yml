@@ -30,21 +30,49 @@
   vars_files:
     - inventory/secrets.yml
 
+  vars:
+    # One literal for the sample-file sentinel the preflight refuses — a
+    # placeholder change only ever happens here.
+    caddy_secret_placeholder: "XXXXXXXXXXXXXXXXX"
+    caddyfile_required_secrets:
+      - namecheap_email
+      - namecheap_api_key
+      - namecheap_user
+      - namecheap_client_ip
+      - crowdsec_api_key
+    # Staging path for the Caddyfile render. Deliberately in the SAME directory
+    # as the live file (same filesystem → atomic rename) and inside the caddy
+    # volume so the container can validate it at
+    # /etc/caddy/Caddyfile.staging. Never left behind: promoted or deleted.
+    caddyfile_staging_path: "{{ caddy_etc_path }}/Caddyfile.staging"
+    caddyfile_staging_container_path: /etc/caddy/Caddyfile.staging
+
   tasks:
     - name: Preflight - fail loudly unless every Caddyfile secret is a real vaulted value
       ansible.builtin.assert:
         that:
-          - namecheap_email is defined and namecheap_email | length > 0 and namecheap_email != 'XXXXXXXXXXXXXXXXX'
-          - namecheap_api_key is defined and namecheap_api_key | length > 0 and namecheap_api_key != 'XXXXXXXXXXXXXXXXX'
-          - namecheap_user is defined and namecheap_user | length > 0 and namecheap_user != 'XXXXXXXXXXXXXXXXX'
-          - namecheap_client_ip is defined and namecheap_client_ip | length > 0 and namecheap_client_ip != 'XXXXXXXXXXXXXXXXX'
-          - crowdsec_api_key is defined and crowdsec_api_key | length > 0 and crowdsec_api_key != 'XXXXXXXXXXXXXXXXX'
+          - lookup('vars', item, default='') | length > 0
+          - lookup('vars', item, default='') != caddy_secret_placeholder
         fail_msg: >-
-          inventory/secrets.yml is missing real values for the Caddy secrets.
-          Copy inventory/secrets.yml.sample, fill in the real values, encrypt the
+          inventory/secrets.yml is missing real values for the Caddy secrets
+          (the failed item label names the offending secret). Copy
+          inventory/secrets.yml.sample, fill in the real values, encrypt the
           whole file with ansible-vault, and run again with --vault-id
           (see RUNBOOK.md). NEVER run this playbook with the sample placeholders:
           Caddy would be rendered with broken keys.
+      loop: "{{ caddyfile_required_secrets }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Resolve uid of the caddy podman user (for XDG_RUNTIME_DIR)
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - contsvc
+      register: caddy_podman_uid
+      changed_when: false
+      check_mode: false
 
     - name: Ensure Caddy configuration directory exists
       ansible.builtin.file:
@@ -52,21 +80,87 @@
         state: directory
         mode: '0755'
 
-    - name: Deploy Caddy reverse proxy configuration
-      ansible.builtin.template:
-        src: Caddyfile-dmz.j2
-        dest: "{{ caddy_etc_path }}/Caddyfile"
-        owner: contsvc
-        group: contsvc
-        mode: '0640'
-        force: true
-      notify: Reload Caddy
+    - name: Read current live Caddyfile state (for converge detection)
+      ansible.builtin.stat:
+        path: "{{ caddy_etc_path }}/Caddyfile"
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: caddyfile_live
 
-    - name: Validate rendered Caddyfile inside the caddy container before reload
-      become_user: contsvc
-      ansible.builtin.command:
-        cmd: /usr/bin/podman exec caddy caddy validate --config /etc/caddy/Caddyfile
-      changed_when: false
+    # Render → validate → promote: the live Caddyfile is only ever replaced
+    # (atomic same-filesystem rename, preserving the staged 0640
+    # contsvc:contsvc) AFTER the staged render passes `caddy validate` inside
+    # the running container. A failure anywhere in the block deletes the staged
+    # copy and aborts, leaving the live file — and therefore the reboot
+    # crontab — pointed at the last known-good config.
+    - name: Render, validate, and promote the Caddyfile (live file untouched until validated)
+      block:
+        - name: Render Caddyfile to the staging path (NOT the live path)
+          # Recreated every run (the promotion below renames it away); whether
+          # the LIVE file changes is decided by the checksum comparison in the
+          # promotion task, so converged runs do not restart caddy.
+          ansible.builtin.template:
+            src: Caddyfile-dmz.j2
+            dest: "{{ caddyfile_staging_path }}"
+            owner: contsvc
+            group: contsvc
+            mode: '0640'
+            force: true
+
+        - name: Checksum the staged Caddyfile (for converge detection)
+          ansible.builtin.stat:
+            path: "{{ caddyfile_staging_path }}"
+            get_checksum: true
+            checksum_algorithm: sha256
+          register: caddyfile_staged
+          changed_when: false
+
+        - name: Validate the staged Caddyfile inside the caddy container before any live change
+          become_user: contsvc
+          environment:
+            XDG_RUNTIME_DIR: "/run/user/{{ caddy_podman_uid.stdout }}"
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/podman
+              - exec
+              - caddy
+              - caddy
+              - validate
+              - --config
+              - "{{ caddyfile_staging_container_path }}"
+          changed_when: false
+
+        - name: Atomically promote the validated Caddyfile (rename within the volume)
+          # mv preserves the staged file's 0640 contsvc:contsvc. Runs (and only
+          # then notifies the reload) when the live file is missing or its
+          # content drifted from the validated render — converged hosts do not
+          # promote or restart.
+          ansible.builtin.command:
+            argv:
+              - mv
+              - -f
+              - "{{ caddyfile_staging_path }}"
+              - "{{ caddy_etc_path }}/Caddyfile"
+          changed_when: true
+          when: >-
+            not caddyfile_live.stat.exists
+            or (caddyfile_live.stat.checksum | default('')) != (caddyfile_staged.stat.checksum | default(''))
+          notify: Reload Caddy
+
+      rescue:
+        - name: Remove the staged Caddyfile so no plaintext-secret copy lingers
+          ansible.builtin.file:
+            path: "{{ caddyfile_staging_path }}"
+            state: absent
+
+        - name: Fail the play - live Caddyfile was not modified
+          ansible.builtin.fail:
+            msg: >-
+              Rendering or validating the staged Caddyfile failed; the staged
+              copy was removed and the live Caddyfile at
+              {{ caddy_etc_path }}/Caddyfile was NOT touched. The running caddy
+              and the reboot crontab keep the last known-good config. Fix the
+              failure and re-run.
 
     - name: Purge plaintext-key Caddyfile fossils from the caddy volume
       ansible.builtin.file:
@@ -74,7 +168,7 @@
         state: absent
       loop: "{{ caddy_caddyfile_fossils }}"
 
-    - name: Reload caddy only if the validated config changed
+    - name: Reload caddy only if the validated config was promoted
       ansible.builtin.meta: flush_handlers
 
   handlers:
