@@ -40,6 +40,20 @@ This playbook automates three main tasks:
 - Per-domain logging
 - Custom routing rules
 
+### Legacy Monitoring Plane (dmz01)
+
+`legacy-monitoring.yml` retires (default) or loopback-rebinds the pre-Alloy local
+prometheus/grafana containers and removes their firewalld ports plus the stale
+`9101/tcp` / `19122/udp` entries. The decision knob is
+`legacy_monitoring_enabled` (group_var, default `false` = retire; data volumes
+preserved). Rationale and blast radius: [docs/legacy-monitoring-decision.md](docs/legacy-monitoring-decision.md).
+
+```bash
+ansible-navigator run --eei localhost/role-dev-ee -m stdout legacy-monitoring.yml -i inventory/inventory.yml
+# override to loopback-rebind instead of retire:
+ansible-navigator run --eei localhost/role-dev-ee -m stdout legacy-monitoring.yml -i inventory/inventory.yml -e legacy_monitoring_enabled=true
+```
+
 ## Security
 
 - OS hardening via devsec.hardening role

@@ -1,0 +1,229 @@
+---
+# legacy-monitoring.yml — retire or rebind the pre-Alloy legacy monitoring plane on dmz01.
+#
+# Ticket: apigban/dmz01#9 · Decision context: dmz01 docs ADR-0001 (Grafana Cloud fed by
+# Alloy is the monitoring system of record; the local prometheus/grafana containers are
+# the legacy plane). Recorded decision + rationale: docs/legacy-monitoring-decision.md
+#
+# Decision knob (override via group_vars/host_vars or -e):
+#   legacy_monitoring_enabled: false  (default, recommended) -> RETIRE:
+#       stop+remove the prometheus and grafana containers (podman named volumes
+#       'prometheus'/'grafana' are preserved unless legacy_monitoring_purge_volumes
+#       is true), remove their firewalld ports plus the stale 9101/tcp and
+#       19122/udp entries, and drop them from the bootstrap crontab.
+#   legacy_monitoring_enabled: true -> REBIND:
+#       containers re-created bound to 127.0.0.1 only (unreachable from the
+#       tailnet), prometheus re-created WITHOUT --web.enable-admin-api; ports
+#       still NOT opened in firewalld; crontab keeps starting them.
+#
+# Idempotency:
+#   - ansible.posix.firewalld state=disabled no-ops once the ports are absent.
+#   - container removal no-ops on missing containers (podman returns rc=125).
+#   - the rebind path only re-creates a container when its live publish binding
+#     is not 127.0.0.1 (checked read-only via podman inspect), so converged hosts
+#     do not churn.
+#   - ansible.builtin.cron replaces the job under the existing
+#     "#Ansible: start podman containers" marker and no-ops once converged.
+#
+# Post-deploy verification (from a second tailnet device):
+#   curl -m 5 http://<dmz01-tailnet-ip>:3000/   -> connection refused / timeout
+#   curl -m 5 http://<dmz01-tailnet-ip>:9100/   -> connection refused / timeout
+#   On dmz01: crontab -l (as contsvc) -> job under the marker matches the chosen mode
+#   On dmz01: sudo firewall-cmd --list-ports --zone=public
+#             -> no 3000/tcp, 9100/tcp, 9101/tcp, 19122/udp
+
+- name: Retire or rebind the legacy local monitoring plane (prometheus/grafana containers)
+  hosts: dmz01
+  gather_facts: false
+  become: true
+  vars:
+    legacy_monitoring_zone: public
+    legacy_monitoring_podman_user: contsvc
+    legacy_monitoring_firewalld_ports:
+      - "3000/tcp"    # legacy grafana (removed, or loopback-bound: never published)
+      - "9100/tcp"    # legacy prometheus (removed, or loopback-bound: never published)
+      - "9101/tcp"    # stale entry: no listener behind it
+      - "19122/udp"   # stale entry: no listener behind it
+    legacy_monitoring_grafana_image: docker.io/grafana/grafana:11.4.0
+    legacy_monitoring_prometheus_image: quay.io/prometheus/prometheus:v3.0.1
+    # Bootstrap crontab job, per mode; caddy -> crowdsec -> opencode order preserved.
+    # With legacy_monitoring_enabled=true this is byte-identical to the current
+    # production job (the rebind only changes how the containers are created).
+    legacy_monitoring_cron_job: "sleep 20;podman start caddy{{ ' prometheus' if legacy_monitoring_enabled else '' }}; sleep 5; podman start crowdsec{{ ' grafana' if legacy_monitoring_enabled else '' }}; nohup opencode web &"
+
+  tasks:
+    - name: Resolve uid of the rootless podman user (for XDG_RUNTIME_DIR)
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - "{{ legacy_monitoring_podman_user }}"
+      register: legacy_monitoring_podman_uid
+      changed_when: false
+      check_mode: false
+
+    # --- firewalld: close the plane and the stale entries (same in both modes) ---
+    - name: Remove legacy monitoring and stale ports from firewalld (permanent + runtime)
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        zone: "{{ legacy_monitoring_zone }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ legacy_monitoring_firewalld_ports }}"
+
+    # --- containers: RETIRE path (default decision, per ADR-0001) ---
+    - name: Retire the legacy monitoring containers (decision = removal per ADR-0001)
+      become_user: "{{ legacy_monitoring_podman_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ legacy_monitoring_podman_uid.stdout }}"
+      when: not legacy_monitoring_enabled
+      block:
+        - name: Remove legacy prometheus container (data volume preserved)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - rm
+              - --force
+              - prometheus
+          register: legacy_monitoring_rm_prometheus
+          changed_when: legacy_monitoring_rm_prometheus.rc == 0
+          failed_when: legacy_monitoring_rm_prometheus.rc not in [0, 125]
+
+        - name: Remove legacy grafana container (data volume preserved)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - rm
+              - --force
+              - grafana
+          register: legacy_monitoring_rm_grafana
+          changed_when: legacy_monitoring_rm_grafana.rc == 0
+          failed_when: legacy_monitoring_rm_grafana.rc not in [0, 125]
+
+        - name: Purge legacy prometheus volume (destructive, opt-in)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - volume
+              - rm
+              - prometheus
+          register: legacy_monitoring_purge_prometheus
+          changed_when: legacy_monitoring_purge_prometheus.rc == 0
+          failed_when: legacy_monitoring_purge_prometheus.rc not in [0, 125]
+          when: legacy_monitoring_purge_volumes
+
+        - name: Purge legacy grafana volume (destructive, opt-in)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - volume
+              - rm
+              - grafana
+          register: legacy_monitoring_purge_grafana
+          changed_when: legacy_monitoring_purge_grafana.rc == 0
+          failed_when: legacy_monitoring_purge_grafana.rc not in [0, 125]
+          when: legacy_monitoring_purge_volumes
+
+    # --- containers: REBIND path (opt-in override) ---
+    - name: Rebind the legacy monitoring containers to loopback only
+      become_user: "{{ legacy_monitoring_podman_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ legacy_monitoring_podman_uid.stdout }}"
+      when: legacy_monitoring_enabled
+      block:
+        - name: Read current prometheus publish binding (read-only)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - inspect
+              - prometheus
+              - --format
+              - '{{ (index .HostConfig.PortBindings "9090/tcp" 0).HostIP }}'
+          register: legacy_monitoring_prometheus_binding
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Read current grafana publish binding (read-only)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - inspect
+              - grafana
+              - --format
+              - '{{ (index .HostConfig.PortBindings "3000/tcp" 0).HostIP }}'
+          register: legacy_monitoring_grafana_binding
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Remove drifted prometheus container (published beyond loopback)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - rm
+              - --force
+              - prometheus
+          changed_when: true
+          when: legacy_monitoring_prometheus_binding.rc != 0 or legacy_monitoring_prometheus_binding.stdout != '127.0.0.1'
+
+        - name: Remove drifted grafana container (published beyond loopback)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - rm
+              - --force
+              - grafana
+          changed_when: true
+          when: legacy_monitoring_grafana_binding.rc != 0 or legacy_monitoring_grafana_binding.stdout != '127.0.0.1'
+
+        - name: Run prometheus bound to loopback only (admin API flag removed)
+          # Deliberately NO --web.enable-admin-api: the flag exposes the mutating
+          # /api/*/admin/tsdb endpoints (delete series, snapshot) unauthenticated.
+          ansible.builtin.command:
+            argv:
+              - podman
+              - run
+              - --detach
+              - --name
+              - prometheus
+              - --publish
+              - "127.0.0.1:9100:9090"
+              - --mount
+              - type=volume,source=prometheus,target=/prometheus
+              - --mount
+              - type=volume,source=prometheus,target=/prometheus/data,subpath=data
+              - "{{ legacy_monitoring_prometheus_image }}"
+              - --config.file=/prometheus/prometheus.yml
+              - --web.listen-address=:9090
+              - --storage.tsdb.path=/prometheus
+          changed_when: true
+          when: legacy_monitoring_prometheus_binding.rc != 0 or legacy_monitoring_prometheus_binding.stdout != '127.0.0.1'
+
+        - name: Run grafana bound to loopback only (config + data volumes preserved)
+          ansible.builtin.command:
+            argv:
+              - podman
+              - run
+              - --detach
+              - --name
+              - grafana
+              - --publish
+              - "127.0.0.1:3000:3000"
+              - --mount
+              - type=volume,source=grafana,target=/var/lib/grafana
+              - --mount
+              - type=volume,source=grafana,target=/etc/grafana/grafana.ini,subpath=grafana.ini
+              - "{{ legacy_monitoring_grafana_image }}"
+          changed_when: true
+          when: legacy_monitoring_grafana_binding.rc != 0 or legacy_monitoring_grafana_binding.stdout != '127.0.0.1'
+
+    # --- bootstrap crontab: converge to the mode-appropriate job ---
+    - name: Converge container bootstrap crontab (caddy/crowdsec/opencode kept)
+      ansible.builtin.cron:
+        name: start podman containers
+        user: "{{ legacy_monitoring_podman_user }}"
+        special_time: reboot
+        job: "{{ legacy_monitoring_cron_job }}"
+        state: present
