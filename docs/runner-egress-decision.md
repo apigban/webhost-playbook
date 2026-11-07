@@ -85,14 +85,23 @@ packets traverse **every** base chain attached to a hook in priority order;
 *"an accept verdict … isn't necessarily final. However, the same is not true
 of packets that are subjected to a drop verdict … drops take immediate
 effect, with no further rules or chains being evaluated."* A drop-only,
-`policy accept` table at output priority 10 therefore:
+`policy accept` table on the output hook — at chain priority `filter` (0),
+deliberately distinct from firewalld's own output chain (see below), where an
+equal-priority tie would have meant registration-order evaluation — therefore:
 
 - drops runner-UID packets to internal destinations regardless of what
-  firewalld decided (firewalld currently defines **no** output filter chain
-  at all on this host — verified against `nft list table inet firewalld`);
-- never bypasses firewalld: we issue no accept verdicts except the
-  port-scoped DNS carve-out inside our own chain, and even an `accept` here
-  only ends our chain's evaluation — traversal of later chains continues;
+  firewalld decided. firewalld's nft table **does** define an output base
+  chain on this host: `filter_OUTPUT` (hook `output`, priority `filter + 10`
+  = 10, policy `accept`). That does not weaken this boundary: a `drop` here
+  is final across **all** base chains on the hook, so a packet we drop is
+  never judged by firewalld's chain at all;
+- never bypasses firewalld in the other direction either: the only `accept`
+  verdicts we issue are the port-scoped DNS carve-outs inside our own chain,
+  and an `accept` in one base chain is **not** final — traversal continues
+  into firewalld's `filter_OUTPUT`, which keeps the final say (its policy is
+  accept, so today a carved-out DNS packet proceeds; any future firewalld
+  output rule would still apply to runner traffic). Neither chain can
+  override the other's drops, whichever order they run in;
 - survives firewalld start/reload/restart (firewalld only manages its own
   table), and vice versa: firewalld never flushes foreign tables.
 
@@ -162,7 +171,7 @@ Deliberate non-goals of this change:
 | 169.254.0.0/16 — link-local + cloud metadata | counter + log | **DROP** |
 | 0.0.0.0/8, 224.0.0.0/4, 255.255.255.255/32 — bogons | counter + log | **DROP** |
 | ::1/128, fc00::/7 (tailscale ULA incl. host v6), fe80::/10 | counter + log | **DROP** |
-| Everything else (github.com, api.github.com, artifacts/caches, npmjs, PyPI, gemini API, Discord webhook, z.ai …) | pass | **pass** (untouched — firewalld today defines no output filter chain) |
+| Everything else (github.com, api.github.com, artifacts/caches, npmjs, PyPI, gemini API, Discord webhook, z.ai …) | pass | **pass** (untouched by this boundary; firewalld's `filter_OUTPUT` on this hook is policy accept, so the overall verdict stays accept) |
 | **All other UIDs** (operator, ansible, web services, root) | **not inspected** | **not inspected** |
 
 Notes: there is **no** `ct state established` exception for internal ranges —
@@ -270,7 +279,9 @@ The ticket asks that firewalld ownership be confirmed and recorded. Confirmed
 ## 10. Merge order
 
 Merge PR #1 first. The two changes are functionally independent (this PR
-touches no firewalld state, no group_vars, no Caddyfile); the only shared
-surface is a README section (adjacency). If PR #1's docs land first, this
-branch rebases trivially. No coordination needed on rules: PR #1's zone-port
-removals and this output-hook table never touch the same state.
+touches no firewalld state and no Caddyfile; its only group_vars addition is
+the two `runner_egress_*` knob defaults, which do not interact with PR #1's
+knobs); the only shared surface is a README section (adjacency). If PR #1's
+docs land first, this branch rebases trivially. No coordination needed on
+rules: PR #1's zone-port removals and this output-hook table never touch the
+same state.
