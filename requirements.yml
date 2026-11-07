@@ -1,6 +1,7 @@
 ---
 collections:
   - name: devsec.hardening
+  - name: ansible.posix    # firewalld module used by legacy-monitoring.yml
 roles:
   - name: apigban.rhel-9.3-base
     src: git+https://git.home.apigban.com/apigban/rhel-9.3-base
