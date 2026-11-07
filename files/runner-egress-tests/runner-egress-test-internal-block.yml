@@ -1,0 +1,104 @@
+# Runner egress verification — Test job B: internal targets unreachable
+#
+# Operator procedure: copy this file into a runner-enabled repo as
+# `.github/workflows/runner-egress-test-internal-block.yml`, then run it
+# manually (workflow_dispatch).
+#
+# Expected outcomes:
+#   - AUDIT mode (runner_egress_enforce=false): this job goes RED on purpose.
+#     Every target below is still reachable; the kernel log lines tagged
+#     `egress-audit` on dmz01 are the paper trail instead of drops.
+#   - ENFORCE mode (runner_egress_enforce=true): this job must be GREEN —
+#     every probe fails to connect (http_code 000) while DNS stays alive.
+#
+# Probes cover every surface from ticket dmz01#13: LAN ranges (192.168.2/24,
+# 172.21.5/24, 172.16.5/24 via wg0), tailscale CGNAT (100.64/10), loopback
+# services (agent :4096, t3 :3773, speakr :8899, legacy grafana :3000,
+# prometheus :9100), the host's own unicast addresses (where 0.0.0.0-bound
+# services are reachable), cloud metadata, and the port-scoped DNS carve-out.
+#
+# Refs: apigban/dmz01#13.
+name: runner-egress check B (internal targets unreachable)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  internal-blocked:
+    runs-on: [self-hosted, agy]
+    timeout-minutes: 10
+    steps:
+      - name: Preflight — confirm we are the filtered UID
+        run: |
+          echo "user: $(id -un) uid: $(id -u)"
+          [[ "$(id -u)" == "$(id -u github-runner)" ]] || {
+            echo "unexpected: job does not run as github-runner"; exit 1; }
+
+      - name: DNS stays functional (carve-out proof)
+        run: |
+          set -euo pipefail
+          getent hosts github.com >/dev/null || { echo "FAIL: DNS broken"; exit 1; }
+          echo "ok: DNS resolution still works inside the boundary"
+
+      - name: Internal targets must NOT be reachable
+        run: |
+          set -uo pipefail
+          probes=$(cat <<'EOF'
+          http://192.168.2.1/
+          http://172.21.5.201/
+          http://172.21.5.202/
+          http://172.16.5.1/
+          http://10.200.0.253/
+          http://10.20.1.1/
+          http://10.20.1.68:4096/
+          http://10.20.1.68:3773/
+          http://100.96.131.75:3000/
+          http://100.96.131.75:4096/
+          http://127.0.0.1:4096/
+          http://127.0.0.1:3773/
+          http://127.0.0.1:8899/
+          http://127.0.0.1:3000/
+          http://127.0.0.1:9100/
+          http://169.254.169.254/latest/meta-data/
+          http://100.100.100.100:80/
+          EOF
+          )
+          leaks=0
+          while read -r target; do
+            [[ -n "$target" ]] || continue
+            code=$(curl -sS -o /dev/null --connect-timeout 4 --max-time 6 \
+                    -w '%{http_code}' "$target" 2>/dev/null || true)
+            if [[ "$code" != "000" ]]; then
+              echo "LEAK: $target reachable (http $code)"
+              leaks=$((leaks + 1))
+            else
+              echo "blocked: $target"
+            fi
+          done <<EOF
+          $probes
+          EOF
+          if [[ "$leaks" -gt 0 ]]; then
+            echo "RESULT: $leaks internal target(s) reachable — boundary NOT enforced (expected RED in audit mode)"
+            exit 1
+          fi
+          echo "RESULT: all internal targets unreachable — boundary enforced"
+
+      - name: IPv6 internal targets must NOT be reachable
+        run: |
+          set -uo pipefail
+          leaks=0
+          for target in 'http://[::1]:4096/' \
+                        'http://[fd7a:115c:a1e0::e101:8365]:4096/'; do
+            code=$(curl -g -sS -o /dev/null --connect-timeout 4 --max-time 6 \
+                    -w '%{http_code}' "$target" 2>/dev/null || true)
+            if [[ "$code" != "000" ]]; then
+              echo "LEAK: $target reachable (http $code)"
+              leaks=$((leaks + 1))
+            else
+              echo "blocked: $target"
+            fi
+          done
+          exit $leaks

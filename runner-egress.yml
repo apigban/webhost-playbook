@@ -1,0 +1,218 @@
+---
+# Usage
+# ansible-galaxy install -r requirements.yml -p roles
+# ansible-navigator run --eei localhost/role-dev-ee -m stdout runner-egress.yml -i inventory/inventory.yml
+#
+# Runner egress boundary for the GitHub Actions runners on this host (dmz01).
+# Draws a firewall boundary around the `github-runner` user (UID resolved at
+# run time): job code can no longer reach LAN/WireGuard/tailscale ranges or the
+# host's own services, while GitHub + package registries + DNS keep working.
+#
+# Audit-first rollout (default):
+#   1. Run the play as-is — rules load in AUDIT mode: counters + rate-limited
+#      kernel log only, NOTHING is dropped. Watch what would have been blocked:
+#        nft list chain inet runner_egress runner_policy
+#        journalctl -k --grep 'egress-audit'
+#   2. When the audit log shows only traffic that should be blocked, promote:
+#        ansible-navigator run ... runner-egress.yml -i inventory/inventory.yml \
+#          -e runner_egress_enforce=true
+#
+# Safety properties (see docs/runner-egress-decision.md):
+#   - Only the resolved runner UID is inspected; operator/admin/service UIDs
+#     are refused by assertion and never filtered.
+#   - firewalld is NOT touched (separate nftables table); the play asserts
+#     firewalld is still active after applying.
+#   - The ruleset file is syntax-validated with `nft -c` before install, and
+#     loading is an atomic full replace — safe to re-run at any time.
+#   - Rollback: `sudo systemctl disable --now runner-egress-nft.service` and
+#     re-run the play with `-e runner_egress_state=absent` (or just
+#     `sudo nft delete table inet runner_egress`).
+#
+# Refs: apigban/dmz01#13. Secrets audit: docs/runner-secrets-audit.md.
+
+- name: Runner egress boundary for GitHub Actions runners
+  hosts: dmz01
+  gather_facts: true
+  become: true
+  vars_files:
+    - inventory/secrets.yml
+
+  vars:
+    runner_egress_user: github-runner
+    # Decision knobs (runner_egress_enforce, runner_egress_state) live in
+    # inventory/group_vars/all/all.yml, matching the legacy-monitoring play's
+    # convention; override per-run with -e (e.g. -e runner_egress_enforce=true).
+    runner_egress_log_rate: 10          # rate-limited log lines per second
+    # UIDs this play must never filter (operator/admin accounts on this host).
+    # Missing accounts are skipped; root (UID 0) is always protected.
+    runner_egress_protected_accounts:
+      - root
+      - contsvc
+      - ansible
+    # DNS destinations allowed through on port 53 (tcp+udp) so the runner user
+    # keeps name resolution. /etc/resolv.conf is tailscale-managed here, so the
+    # resolver sits INSIDE ranges that are otherwise blocked.
+    runner_egress_dns_v4:
+      - 100.100.100.100                 # tailscale MagicDNS (primary resolver)
+      - 127.0.0.53                      # systemd-resolved stub
+      - 127.0.0.54                      # systemd-resolved stub (extra)
+    runner_egress_dns_v6:
+      - fd7a:115c:a1e0::53              # tailscale MagicDNS v6 (secondary)
+    # Blocked destination ranges (RFC1918 + CGNAT/tailscale + link-local +
+    # loopback + bogons). The host's own addresses (10.20.1.68, 10.200.0.1,
+    # 100.96.131.75, fd7a:115c:a1e0::e101:8365) all fall inside these.
+    runner_egress_block_v4:
+      - 127.0.0.0/8
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 100.64.0.0/10
+      - 169.254.0.0/16
+      - 0.0.0.0/8
+      - 224.0.0.0/4
+      - 255.255.255.255/32
+    runner_egress_block_v6:
+      - ::1/128
+      - fc00::/7
+      - fe80::/10
+    runner_egress_nft_path: /etc/nftables.d/runner-egress.nft
+    runner_egress_unit: runner-egress-nft.service
+
+  tasks:
+    - name: Collect password database for UID resolution
+      ansible.builtin.getent:
+        database: passwd
+
+    - name: Resolve runner UID (0 sentinel if user missing)
+      ansible.builtin.set_fact:
+        runner_egress_uid_resolved: "{{ getent_passwd[runner_egress_user][1] | default(0) | int }}"
+
+    - name: Resolve protected UIDs (missing accounts are skipped)
+      ansible.builtin.set_fact:
+        runner_egress_protected_uids: "{{ runner_egress_protected_uids | default([0]) + [getent_passwd[item][1] | int] }}"
+      loop: "{{ runner_egress_protected_accounts }}"
+      when: item in getent_passwd
+
+    - name: Refuse unsafe configuration (never lock out the operator)
+      ansible.builtin.assert:
+        that:
+          - runner_egress_uid_resolved | int > 0
+          - runner_egress_uid_resolved | int not in (runner_egress_protected_uids | map('int') | list)
+          - runner_egress_enforce is boolean
+          - runner_egress_state in ['present', 'absent']
+        fail_msg: >-
+          Refusing to deploy: UID for '{{ runner_egress_user }}' must resolve to a dedicated,
+          non-protected account (got {{ runner_egress_uid_resolved }}; protected UIDs are
+          {{ runner_egress_protected_uids | default([0]) }}), runner_egress_enforce must be
+          boolean, runner_egress_state must be present|absent.
+
+    - name: Remove runner egress boundary
+      when: runner_egress_state == 'absent'
+      block:
+        - name: Stop and disable loader unit
+          ansible.builtin.systemd:
+            name: "{{ runner_egress_unit }}"
+            state: stopped
+            enabled: false
+          failed_when: false
+
+        - name: Remove loader unit file
+          ansible.builtin.file:
+            path: /etc/systemd/system/{{ runner_egress_unit }}
+            state: absent
+          notify: Reload systemd
+
+        - name: Remove ruleset file
+          ansible.builtin.file:
+            path: "{{ runner_egress_nft_path }}"
+            state: absent
+
+        - name: Delete nftables table
+          ansible.builtin.command:
+            cmd: nft delete table inet runner_egress
+          changed_when: true
+          failed_when: false
+
+        - name: Report removal
+          ansible.builtin.debug:
+            msg: "Runner egress boundary removed ({{ runner_egress_user }} unrestricted again)."
+
+        - meta: flush_handlers
+
+    - name: End play after removal
+      when: runner_egress_state == 'absent'
+      ansible.builtin.meta: end_host
+
+    - name: Ensure nftables is installed
+      ansible.builtin.package:
+        name: nftables
+        state: present
+
+    - name: Create nftables drop-in directory
+      ansible.builtin.file:
+        path: /etc/nftables.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Deploy runner egress ruleset (offline-validated before install)
+      ansible.builtin.template:
+        src: runner-egress.nft.j2
+        dest: "{{ runner_egress_nft_path }}"
+        owner: root
+        group: root
+        mode: '0640'
+        validate: /usr/sbin/nft -c -f %s
+      notify: Restart runner egress filter
+
+    - name: Deploy loader unit
+      ansible.builtin.template:
+        src: runner-egress-nft.service.j2
+        dest: /etc/systemd/system/{{ runner_egress_unit }}
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart runner egress filter
+
+    - name: Enable and start loader unit
+      ansible.builtin.systemd:
+        name: "{{ runner_egress_unit }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Verify table is loaded and chain is populated
+      ansible.builtin.command:
+        cmd: nft list chain inet runner_egress runner_policy
+      register: runner_egress_verify
+      changed_when: false
+      failed_when: runner_egress_verify.rc != 0 or 'runner_policy' not in runner_egress_verify.stdout
+
+    - name: Verify firewalld is untouched and still running
+      ansible.builtin.command:
+        cmd: systemctl is-active firewalld
+      register: runner_egress_firewalld
+      changed_when: false
+      failed_when: runner_egress_firewalld.stdout != 'active'
+
+    - name: Rollout summary
+      ansible.builtin.debug:
+        msg:
+          mode: "{{ 'ENFORCE (drops active)' if runner_egress_enforce else 'AUDIT (counters + log only)' }}"
+          user: "{{ runner_egress_user }}"
+          uid: "{{ runner_egress_uid_resolved }}"
+          inspect: "nft list chain inet runner_egress runner_policy"
+          audit_log: "journalctl -k --grep 'egress-audit'"
+          promote: "re-run with -e runner_egress_enforce=true"
+
+  handlers:
+    - name: Restart runner egress filter
+      ansible.builtin.systemd:
+        name: "{{ runner_egress_unit }}"
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

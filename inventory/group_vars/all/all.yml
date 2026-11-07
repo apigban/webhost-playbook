@@ -30,3 +30,17 @@ sites:
     local_path: /var/www/html
     repo_url: https://github.com/apigban/alain.apigban.com.git
     port: 10000
+
+# Runner egress boundary knobs on dmz01 (apigban/dmz01#13; see runner-egress.yml
+# and docs/runner-egress-decision.md). Implementation-detail vars (protected
+# accounts, DNS carve-outs, block ranges, nft paths) stay in the play.
+#   runner_egress_enforce:
+#     false (default) -> AUDIT: counters + rate-limited kernel log only,
+#       NOTHING is dropped. Watch `nft list chain inet runner_egress
+#       runner_policy` and `journalctl -k --grep 'egress-audit'` first.
+#     true -> ENFORCE: internal-bound traffic from the runner user is dropped.
+#       Promote only after the audit pass (decision doc, section 9).
+#   runner_egress_state: present (default) | absent (removes the boundary
+#     entirely).
+runner_egress_enforce: false
+runner_egress_state: present
