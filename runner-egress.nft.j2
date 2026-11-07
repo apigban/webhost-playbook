@@ -9,9 +9,16 @@
 #   coexists with firewalld's `inet firewalld` table without touching it.
 #   firewalld cannot match by originating UID (open RFE firewalld#725), which is
 #   why this boundary lives outside firewalld entirely.
-# - Output-hook filter chain with policy accept: non-matching traffic (every UID
-#   except the runner user, including the operator) falls through untouched and
-#   continues to any later base chain. Drops anywhere in the hook are final.
+# - Output-hook filter chain with policy accept at priority 0 (filter):
+#   deliberately DISTINCT from firewalld's own output base chain
+#   (`filter_OUTPUT`, hook output, priority filter+10 = 10, policy accept) so
+#   the two never tie; nftables would order equal-priority base chains by
+#   registration order, which is needless ambiguity. Order does not change the
+#   verdict semantics: non-matching traffic (every UID except the runner user,
+#   including the operator) falls through untouched and continues into
+#   firewalld's chain; a drop here is final across all base chains on the hook,
+#   and an accept here is NOT final — firewalld still gets to judge the packet,
+#   so this table cannot bypass firewalld either.
 # - The add/delete/add table idiom makes `nft -f` a full atomic replace (single
 #   netlink transaction): re-running the loader can never leave stale rules.
 table inet runner_egress
@@ -19,7 +26,7 @@ delete table inet runner_egress
 table inet runner_egress {
 
     chain egress {
-        type filter hook output priority 10; policy accept;
+        type filter hook output priority 0; policy accept;
 
         # Only the dedicated runner user's locally-created sockets are inspected.
         meta skuid {{ runner_egress_uid_resolved }} jump runner_policy
