@@ -116,12 +116,17 @@ ansible-navigator run --eei localhost/role-dev-ee -m stdout \
 
 The play now:
 1. asserts real secrets are present (preflight),
-2. renders `Caddyfile-dmz.j2` into the caddy volume (`0640 contsvc:contsvc`),
-3. runs `caddy validate` inside the container **before** reload — a broken
-   render stops the play and the running caddy keeps its old in-memory config,
-4. deletes the plaintext-key fossils (`caddy_caddyfile_fossils` in
-   `inventory/group_vars/all/all.yml`), restarting caddy only on a validated
-   config.
+2. renders `Caddyfile-dmz.j2` to a **staging** file inside the caddy volume
+   (`0640 contsvc:contsvc`) — the live path is not touched yet,
+3. runs `caddy validate` inside the container against the **staged** file — a
+   broken render fails the block, the staged copy is deleted, and the live
+   Caddyfile (and the running caddy / reboot crontab) keep the old config,
+4. atomically renames the validated staging file over the live path (`mv`
+   within the volume, preserving `0640 contsvc:contsvc`), and only then
+   restarts caddy via the handler,
+5. deletes the plaintext-key fossils (`caddy_caddyfile_fossils` in
+   `inventory/group_vars/all/all.yml`); the reload runs only if a validated
+   config was actually promoted.
 
 Preview the fossil purge without touching anything:
 `ansible-playbook main.yml -i inventory/inventory.yml --vault-id prod@prompt --check`
