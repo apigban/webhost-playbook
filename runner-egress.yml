@@ -39,9 +39,9 @@
 
   vars:
     runner_egress_user: github-runner
-    # AUDIT by default (counters + log, no drops). Set true to enforce drops.
-    runner_egress_enforce: false
-    runner_egress_state: present        # absent removes the boundary entirely
+    # Decision knobs (runner_egress_enforce, runner_egress_state) live in
+    # inventory/group_vars/all/all.yml, matching the legacy-monitoring play's
+    # convention; override per-run with -e (e.g. -e runner_egress_enforce=true).
     runner_egress_log_rate: 10          # rate-limited log lines per second
     # UIDs this play must never filter (operator/admin accounts on this host).
     # Missing accounts are skipped; root (UID 0) is always protected.
