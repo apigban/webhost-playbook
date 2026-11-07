@@ -47,3 +47,15 @@ This playbook automates three main tasks:
 - CrowdSec integration
 - Automated SSL/TLS management
 - Separate access logs per domain
+
+### Secrets & vault
+
+All secrets live in `inventory/secrets.yml` (gitignored), which must be
+**encrypted with `ansible-vault`** — schema in
+[`inventory/secrets.yml.sample`](inventory/secrets.yml.sample). Run playbooks
+with a vault id, e.g. `--vault-id prod@prompt`. The Caddy play fails at a
+preflight assert if the Namecheap/CrowdSec secrets are missing or left as
+placeholders, so a broken Caddyfile can never be rendered.
+
+**Key rotation** (Namecheap API key, CrowdSec bouncer key) and fossil-file
+purging: follow [`RUNBOOK.md`](RUNBOOK.md).

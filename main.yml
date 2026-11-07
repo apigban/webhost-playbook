@@ -31,6 +31,21 @@
     - inventory/secrets.yml
 
   tasks:
+    - name: Preflight - fail loudly unless every Caddyfile secret is a real vaulted value
+      ansible.builtin.assert:
+        that:
+          - namecheap_email is defined and namecheap_email | length > 0 and namecheap_email != 'XXXXXXXXXXXXXXXXX'
+          - namecheap_api_key is defined and namecheap_api_key | length > 0 and namecheap_api_key != 'XXXXXXXXXXXXXXXXX'
+          - namecheap_user is defined and namecheap_user | length > 0 and namecheap_user != 'XXXXXXXXXXXXXXXXX'
+          - namecheap_client_ip is defined and namecheap_client_ip | length > 0 and namecheap_client_ip != 'XXXXXXXXXXXXXXXXX'
+          - crowdsec_api_key is defined and crowdsec_api_key | length > 0 and crowdsec_api_key != 'XXXXXXXXXXXXXXXXX'
+        fail_msg: >-
+          inventory/secrets.yml is missing real values for the Caddy secrets.
+          Copy inventory/secrets.yml.sample, fill in the real values, encrypt the
+          whole file with ansible-vault, and run again with --vault-id
+          (see RUNBOOK.md). NEVER run this playbook with the sample placeholders:
+          Caddy would be rendered with broken keys.
+
     - name: Ensure Caddy configuration directory exists
       ansible.builtin.file:
         path: "{{ caddy_etc_path }}"
@@ -41,9 +56,26 @@
       ansible.builtin.template:
         src: Caddyfile-dmz.j2
         dest: "{{ caddy_etc_path }}/Caddyfile"
-        mode: '0755'
+        owner: contsvc
+        group: contsvc
+        mode: '0640'
         force: true
       notify: Reload Caddy
+
+    - name: Validate rendered Caddyfile inside the caddy container before reload
+      become_user: contsvc
+      ansible.builtin.command:
+        cmd: /usr/bin/podman exec caddy caddy validate --config /etc/caddy/Caddyfile
+      changed_when: false
+
+    - name: Purge plaintext-key Caddyfile fossils from the caddy volume
+      ansible.builtin.file:
+        path: "{{ caddy_etc_path }}/{{ item }}"
+        state: absent
+      loop: "{{ caddy_caddyfile_fossils }}"
+
+    - name: Reload caddy only if the validated config changed
+      ansible.builtin.meta: flush_handlers
 
   handlers:
     - name: Reload Caddy
