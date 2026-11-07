@@ -1,10 +1,10 @@
 {
         order coraza_waf first
-        email {{ namecheap_email}}
+        email {{ namecheap_email }}
         debug
         admin :2019
         crowdsec {
-                api_url http://localhost:8080
+                api_url {{ crowdsec_api_url | default('http://localhost:8080') }}
                 api_key {{ crowdsec_api_key }}
                 ticker_interval 15s
         }

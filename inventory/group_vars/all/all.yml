@@ -17,6 +17,13 @@ site_path: /home/ansible/sites/{{ site_name }}
 web_path: /var/www/html
 caddy_etc_path: /home/contsvc/.local/share/containers/storage/volumes/caddy_etc/_data
 
+# Stale copies of the Caddyfile that contain plaintext secrets. Purged on every
+# deploy of the Caddy reverse proxy play (refs apigban/dmz01#8). Extend this list
+# if dated copies accumulate again; never keep unencrypted Caddyfile copies here.
+caddy_caddyfile_fossils:
+  - Caddyfile.bak
+  - Caddyfile-2026-01-11
+
 hugo:
   commands:
     - /usr/local/bin/hugo mod get -u 
